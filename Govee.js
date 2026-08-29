@@ -4,10 +4,6 @@ export function Version() { return "1.0.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "WhirlwindFX"; }
 export function Size() { return [22, 1]; }
-
-// False, with SetIsSubdeviceController called per device instead. Only 5 of the ~68 library
-// entries are built from separate physical pieces; declaring every Govee light a subdevice
-// controller made bulbs and single-segment strips ask to be configured before they would light.
 export function SubdeviceController() { return true; }
 /* global
 controller:readonly
@@ -18,45 +14,26 @@ forcedColor:readonly
 TurnOffOnShutdown:readonly
 protocolSelect:readonly
 blendSegments:readonly
-variableLedCount:readonly
-streamKeepalive:readonly
-statusQuery:readonly
 */
 export function ControllableParameters() {
 	return [
 		{property:"shutdownColor", group:"lighting", label:"Shutdown Color", description: "This color is applied to the device when the System, or SignalRGB is shutting down", min:"0", max:"360", type:"color", default:"#000000"},
 		{property:"LightingMode", group:"lighting", label:"Lighting Mode", description: "Determines where the device's RGB comes from. Canvas will pull from the active Effect, while Forced will override it to a specific color", type:"combobox", values:["Canvas", "Forced"], default:"Canvas"},
 		{property:"forcedColor", group:"lighting", label:"Forced Color", description: "The color used when 'Forced' Lighting Mode is enabled", min:"0", max:"360", type:"color", default:"#009bde"},
-		{property:"TurnOffOnShutdown", group:"settings", label:"Turn off when ignored", description: "This turns off the device when it is ignored or disabled, and when the app shuts down", type:"boolean", default:"false"},
+		{property:"TurnOffOnShutdown", group:"settings", label:"Turn off on unlink process", description: "This turns off the device during the unlink/disabling of the device process or shutdown of the app", type:"boolean", default:"false"},
 		{property:"protocolSelect", group:"settings", label:"Protocol", description: "Determines which protocol will be used to control the device. Auto picks the best protocol this device is known to support, and is the right choice unless you're troubleshooting. (Not all protocols works on a device)", type:"combobox", values:["Auto", "Dreamview", "RazerV1", "RazerV2", "Static"], default:"Auto"},
 		{property:"blendSegments", group:"settings", label:"Blend Between Segments", description: "Lets the device fade between the colors we send instead of applying each one to its own segment. Auto follows what the device library says. Softer on a strip, wrong on anything built from separate physical pieces like a curtain, where it blends across a gap that is not there in the light.", type:"combobox", values:["Auto", "On", "Off"], default:"Auto"},
-		// TEMPORARY, both of these. They exist to settle whether stream mode really auto-disables in
-		// the firmware, which is the only thing that ever justified paying a dropped frame on a timer.
-		// Remove both once that is known -- see the comment on MaintainStreamingMode.
-		{property:"streamKeepalive", group:"settings", label:"Stream Keepalive (test)", description: "How stream mode is kept alive. Sending the stream mode command costs a dropped frame on the device, so 'On loss only' sends it just when the device stops answering. 'Never' never re-sends it after startup. 'Timer 40s' is the old behaviour, kept only so the two can be compared on the bench.", type:"combobox", values:["On loss only", "Never", "Timer 40s"], default:"On loss only"},
-		{property:"statusQuery", group:"settings", label:"Status Query (test)", description: "Whether to send the once-a-second status query in among the colour frames. Its replies are what tell us the device is still listening, but the query is also the main suspect for knocking the device out of stream mode in the first place. Turning it off removes both.", type:"boolean", default:"true"},
 	];
 }
 
 /** @type {GoveeProtocol} */
 let govee;
 
-// Matches what shipped before the components rewrite. A device we cannot identify gets a
-// modest strip rather than a large one: too few LEDs renders a coarse version of the effect,
-// while too many silently pushes past what the device accepts -- and above roughly 20 some
-// devices blank entirely rather than clamping.
-const UnknownSkuLedCount = 20;
+const UnknownSkuLedCount = 120;
 
-/** The device's LED layout, as handed to setControllableLeds. Rebuilt by SetLedCount whenever
- * the count changes, and the source of truth for how many colors go on the wire. */
-let ledCount = 0;
-let ledNames = [];
-let ledPositions = [];
-
-/** Populated only for library entries with usesSubDevices -- devices built from separate
- * physical pieces, where each piece is placed on the canvas independently.
- * @type {{id: string, name: string, ledCount: number, size: number[], ledNames: string[], ledPositions: number[][]}[]} */
-let subdevices = [];
+/** Channels this device renders through, in the order their colors go on the wire.
+ * @type {{name: string, ledCount: number}[]} */
+let channels = [];
 
 /** Protocol used while protocolSelect is left on "Auto". Resolved per device from the
  * library, so a device only ever gets a protocol it's known to support. */
@@ -97,16 +74,10 @@ let loggedFirstStatusReply = false;
 let loggedNoStatusReplies = false;
 let streamLooksLost = false;
 
-/** Only reachable through the "Timer 40s" test setting. Not a path worth keeping -- see
- * MaintainStreamingMode. */
-const StreamingAssertInterval = 40000;
-let lastStreamingAssert = 0;
-
 export function Initialize(){
 	loggedFirstFrame = false;
 	renderCount = 0;
 	sawConnectedSocket = false;
-	lastStreamingAssert = 0;
 	lastStatusReply = 0;
 	loggedFirstStatusReply = false;
 	loggedNoStatusReplies = false;
@@ -134,9 +105,6 @@ export function Initialize(){
 	// device that is still streaming from one that has silently stopped accepting frames.
 	UDPServer.setCallbackFunction(OnDeviceResponse);
 
-	// Subdevices survive a reload, so they have to be torn down before the layout is rebuilt or
-	// a device accumulates a fresh set on every Initialize.
-	ClearSubdevices();
 	fetchDeviceInfoFromTableAndConfigure();
 
 	govee = new GoveeProtocol(controller.ip, controller.supportDreamView, controller.supportRazer);
@@ -175,6 +143,10 @@ export function Render(){
 		govee.SetStreamingMode(true);
 	}
 
+	// Stream mode is handed to us by one unacknowledged datagram, so a lost packet leaves the device
+	// ignoring every frame while looking fine from here. Assert it on the opening frames to cover
+	// that. Beyond that, only re-assert it if the device has actually gone quiet -- see
+	// MaintainStreamingMode for why a scheduled re-assert on a timer is not an option.
 	MaintainStreamingMode();
 
 	renderCount++;
@@ -194,36 +166,8 @@ export function Render(){
  *
  * The evidence that stream mode was lost is the device going quiet. It answers the status query
  * SendEncodedPacket sends, so replies arriving mean it is still on the other end; silence past
- * StreamLostAfter means it is not, and that is the one case worth a dropped frame.
- *
- * The two other modes are temporary, and exist to settle whether the firmware really has the one
- * minute auto-disable the protocol reference claims. It has never been measured, and the bench
- * result it rests on has a competing explanation -- the status query itself dropping the device out
- * of stream mode -- so both halves have to be switchable to tell them apart. Delete them, and the
- * settings that drive them, once that is known. */
+ * StreamLostAfter means it is not, and that is the one case worth a dropped frame. */
 function MaintainStreamingMode(){
-	if(streamKeepalive === "Never"){
-		return;
-	}
-
-	// The old behaviour, kept only for bench comparison. Flashes every 40 seconds by design.
-	if(streamKeepalive === "Timer 40s"){
-		const now = Date.now();
-
-		if(now - lastStreamingAssert > StreamingAssertInterval){
-			lastStreamingAssert = now;
-			govee.SetStreamingMode(true);
-		}
-
-		return;
-	}
-
-	// Nothing to judge while the query that produces the replies is switched off. Assert on connect
-	// is all that is left in that configuration, which is the point of being able to switch it off.
-	if(!statusQuery){
-		return;
-	}
-
 	if(lastStatusReply === 0){
 		// Never answered at all. Worth saying once, because it means this device gives us no
 		// liveness signal and the protocol's status command may simply be named something else --
@@ -325,8 +269,7 @@ function fetchDeviceInfoFromTableAndConfigure() {
 		device.setName(`Govee: ${controller.sku}`);
 		// An unrecognised device gets the one protocol every Govee light accepts.
 		autoProtocol = "Static";
-		device.SetIsSubdeviceController(false);
-		SetLedCount(UnknownSkuLedCount);
+		ConfigureChannels([{ name: `Channel 1`, ledCount: UnknownSkuLedCount }]);
 
 		return;
 	}
@@ -336,38 +279,7 @@ function fetchDeviceInfoFromTableAndConfigure() {
 	device.setName(`Govee ${GoveeDeviceInfo.sku} - ${GoveeDeviceInfo.name}`);
 	autoProtocol = GetAutoProtocol(GoveeDeviceInfo);
 	device.log(`Auto protocol for ${GoveeDeviceInfo.sku} resolved to ${autoProtocol}.`);
-
-	// The library count is a best guess for devices sold in several lengths, so those expose it as
-	// a setting. This is the only way a user can correct a wrong count, which is why it has to be
-	// wired to something -- the flag sat declared and unread while components were the only path.
-	if(GoveeDeviceInfo.hasVariableLedCount){
-		device.addProperty({property: "variableLedCount", group: "settings", label: "Segment Count", description: "How many segments this device has. The library ships a default per SKU, but these are sold in several lengths, so correct it here if the effect does not reach the end of the device.", type: "number", min: 1, max: 60, default: GoveeDeviceInfo.ledCount, step: 1});
-		SetLedCount(variableLedCount);
-	}else{
-		SetLedCount(GoveeDeviceInfo.ledCount);
-		device.removeProperty("variableLedCount");
-	}
-
-	// Only devices genuinely built from separate physical pieces become subdevice controllers, so
-	// each piece can be placed on the canvas on its own. Everything else is one continuous run and
-	// is rendered from the device layout above, with nothing for the user to configure.
-	if(GoveeDeviceInfo.usesSubDevices){
-		device.SetIsSubdeviceController(true);
-
-		for(const subdevice of GoveeDeviceInfo.subdevices){
-			CreateSubDevice(subdevice);
-		}
-	}else{
-		// Patched: keep manual component support enabled for every device (matches
-		// the old Main-branch behaviour), instead of only devices hardcoded with
-		// usesSubDevices in the library above.
-		device.SetIsSubdeviceController(true);
-	}
-}
-
-/** Called by the host when the user changes the Segment Count setting on a device that has one. */
-export function onvariableLedCountChanged(){
-	SetLedCount(variableLedCount);
+	ConfigureChannels(GetChannelLayout(GoveeDeviceInfo));
 }
 
 function GetAutoProtocol(GoveeDeviceInfo){
@@ -398,107 +310,31 @@ function ShouldBlend(){
 	return blendByDefault;
 }
 
-/** Gives the device a real LED layout. This is what lets a device light straight after being
- * linked: the host can map the canvas onto it without the user assigning anything first. */
-function SetLedCount(count){
-	ledCount = count;
-
-	CreateLedMap();
-	device.setSize([ledCount, 1]);
-	device.setControllableLeds(ledNames, ledPositions);
-}
-
-/** A single horizontal run. Every DreamView device addresses its segments as one ordered
- * sequence, so the wire order is the layout order and there is nothing cleverer to do here. */
-function CreateLedMap(){
-	ledNames = [];
-	ledPositions = [];
-
-	for(let i = 0; i < ledCount; i++){
-		ledNames.push(`Led ${i + 1}`);
-		ledPositions.push([i, 0]);
-	}
-}
-
-function ClearSubdevices(){
-	for(const subdevice of device.getCurrentSubdevices()){
-		device.removeSubdevice(subdevice);
+function GetChannelLayout(GoveeDeviceInfo){
+	// Devices built from multiple segments (paired light bars and the like) get a channel
+	// each, so every segment can be given its own component.
+	if(GoveeDeviceInfo.usesSubDevices){
+		return GoveeDeviceInfo.subdevices.map((subdevice, index) => ({
+			name: `Channel ${index + 1}`,
+			ledCount: subdevice.ledCount
+		}));
 	}
 
-	subdevices = [];
+	return [{ name: `Channel 1`, ledCount: GoveeDeviceInfo.ledCount }];
 }
 
-function CreateSubDevice(subdevice){
-	const count = device.getCurrentSubdevices().length;
-	subdevice.id = `${subdevice.name} ${count + 1}`;
-	device.createSubdevice(subdevice.id);
+function ConfigureChannels(layout){
+	channels = layout;
 
-	device.setSubdeviceName(subdevice.id, subdevice.name);
-	device.setSubdeviceImage(subdevice.id, controller.deviceImage);
-	device.setSubdeviceSize(subdevice.id, subdevice.size[0], subdevice.size[1]);
-	device.setSubdeviceLeds(subdevice.id, subdevice.ledNames, subdevice.ledPositions);
+	let totalLedCount = 0;
 
-	subdevices.push(subdevice);
-}
-
-/** The single color every LED takes this frame, or undefined to read the canvas per LED.
- *
- * Color properties arrive from the host as objects rather than hex strings, so this goes through
- * createColorArray instead of parsing hex -- the reason the old hexToRgb helper is not restored
- * along with the rest of this. */
-function FixedFrameColor(overrideColor){
-	if(overrideColor){
-		return device.createColorArray(overrideColor, 1, "Inline");
+	for(const channel of channels){
+		device.addChannel(channel.name, channel.ledCount);
+		device.channel(channel.name).SetLedLimit(channel.ledCount);
+		totalLedCount += channel.ledCount;
 	}
 
-	if(LightingMode === "Forced"){
-		return device.createColorArray(forcedColor, 1, "Inline");
-	}
-
-	return undefined;
-}
-
-/** Colors for a device rendered as one continuous run, in layout order. */
-function GetDeviceRGB(overrideColor){
-	const RGBData = new Array(ledCount * 3).fill(0);
-	const fixedColor = FixedFrameColor(overrideColor);
-
-	for(let i = 0; i < ledPositions.length; i++){
-		const ledPosition = ledPositions[i];
-		const color = fixedColor ?? device.color(ledPosition[0], ledPosition[1]);
-
-		RGBData[i * 3] = color[0];
-		RGBData[i * 3 + 1] = color[1];
-		RGBData[i * 3 + 2] = color[2];
-	}
-
-	return RGBData;
-}
-
-/** Colors for a device built from separate pieces, in subdevice order, which is the order the
- * device chains them on the wire.
- *
- * The index runs across all subdevices rather than restarting inside each. The version that
- * shipped before the components rewrite restarted it, so with two identically shaped pieces --
- * which is every such entry in the library -- the second overwrote the first and only half the
- * device's colors were ever sent. */
-function GetRGBFromSubdevices(overrideColor){
-	const RGBData = [];
-	const fixedColor = FixedFrameColor(overrideColor);
-	let index = 0;
-
-	for(const subdevice of subdevices){
-		for(const ledPosition of subdevice.ledPositions){
-			const color = fixedColor ?? device.subdeviceColor(subdevice.id, ledPosition[0], ledPosition[1]);
-
-			RGBData[index * 3] = color[0];
-			RGBData[index * 3 + 1] = color[1];
-			RGBData[index * 3 + 2] = color[2];
-			index++;
-		}
-	}
-
-	return RGBData;
+	device.SetLedLimit(totalLedCount);
 }
 
 // -------------------------------------------<( Discovery Service )>--------------------------------------------------
@@ -532,10 +368,15 @@ export function DiscoveryService() {
 			this.CreateControllerDevice(value);
 			this.checkCachedDevice(value.ip);
 
-			// Nothing to link. A cached device is one the user has already accepted, so it is adopted
-			// unless they explicitly ignored it, and announcing it is announce()'s job on the Update
-			// tick that follows this loop. This used to call link() here, which announced a second
-			// time and so listed every accepted device twice.
+			// A device in the cache is one the user has already accepted, so control it unless they
+			// have explicitly said not to. The stored flag is named "paired", but the only thing it
+			// ever means is "ignored": unlink writes false, nothing else does. Requiring true left
+			// anyone whose flag was lost -- or never written -- with a device that appears in the
+			// list and does nothing, recoverable only by pressing Link, which is not a thing we can
+			// ask of people.
+			if(value.paired !== false){
+				this.link(value)
+			}
 		}
 	};
 
@@ -690,44 +531,36 @@ export function DiscoveryService() {
 		}
 	};
 
-	/** Undoes an ignore. There is no such thing as linking a Govee light: the LAN API is
-	 * unauthenticated UDP on port 4003 and nothing is ever negotiated with the device, so the only
-	 * state a user can meaningfully set is whether we leave it alone. This was called link(), and
-	 * the button for it said "Link", which described a handshake that does not exist. */
-	this.restore = function(controllerObj){
-		service.log(`Restoring controller: ${controllerObj.id}`);
+	this.link = function(controllerObj){
+		service.log(`Linking controller: ${controllerObj.id} - Paired: ${controllerObj.paired} `);
 
 		const controller = service.getController(controllerObj.id);
 
 		if(controller === undefined){
-			service.log(`Cannot restore ${controllerObj.id}, no controller exists for it.`);
+			service.log(`Cannot link ${controllerObj.id}, no controller exists for it.`);
 
 			return;
 		}
 
-		controller.ignored = false;
+		controller.paired = true;
 
 		// Update controller
 		controller.updateWithValue(controller);
-
-		// Announced directly rather than through announce(), which has already run for this
-		// controller and would correctly refuse to run again. This is the user asking by name.
 		service.announceController(controller);
 
 		// Update cache
 		this.cacheControllerInfo(controller);
 
-		service.log(`Restored controller: ${controller.id}`);
+		service.log(`Linked controller: ${controller.id} - Paired: ${controller.paired} `);
 	}
 
-	/** Tells us to leave a device alone. The only real state in here -- see restore(). */
-	this.ignore = function(controllerObj) {
-		service.log(`Ignoring controller: ${JSON.stringify(controllerObj)}`);
+	this.unlink = function(controllerObj) {
+		service.log(`Unlinking controller: ${JSON.stringify(controllerObj)}`);
 
 		const controller = service.getController(controllerObj.id);
 
 		if(controller === undefined){
-			service.log(`Cannot ignore ${controllerObj.id}, no controller exists for it.`);
+			service.log(`Cannot unlink ${controllerObj.id}, no controller exists for it.`);
 
 			return;
 		}
@@ -740,7 +573,7 @@ export function DiscoveryService() {
 			this.activeSockets.delete(controllerObj.ip);
 		}
 
-		controller.ignored = true;
+		controller.paired = false;
 
 		controller.updateWithValue(controller);
 		service.suppressController(controller);
@@ -753,7 +586,7 @@ export function DiscoveryService() {
 		discovery.cache.Add(
 			value.id, {
 				id: value.id,
-				ignored: value.ignored,
+				paired: value.paired,
 				ip: value.ip,
 				name: value.sku,
 				GoveeInfo: value.GoveeInfo,
@@ -772,45 +605,14 @@ export function DiscoveryService() {
 	}
 }
 
-/** Reads a controller's ignore flag, converting entries written before it was called that.
- *
- * The flag used to be stored as "paired", the inverse of this one, and it never meant pairing --
- * ignoring a device wrote false and nothing ever wrote true except a Link button for a handshake
- * that does not exist. Old entries are converted rather than dropped, or every device anyone had
- * ignored reappears the first time they run this build.
- *
- * Absent everywhere means not ignored, which is the right default: a device the user has not spoken
- * about is one we adopt. */
-function ResolveIgnored(value, id){
-	const cached = discovery.cache.Get(id);
-
-	if(value?.ignored !== undefined){
-		return value.ignored;
-	}
-
-	if(cached?.ignored !== undefined){
-		return cached.ignored;
-	}
-
-	if(value?.paired !== undefined){
-		return value.paired === false;
-	}
-
-	if(cached?.paired !== undefined){
-		return cached.paired === false;
-	}
-
-	return false;
-}
-
 class GoveeController{
 	 constructor(value){
 		this.id = value?.id ?? "Unknown ID";
-		// Discovery responses carry no ignore state, and this constructor persists straight to the
-		// cache below. Without the cache fallback a scan reply that arrives before the cached devices
-		// load rebuilds the controller as not-ignored and writes that over the stored flag, so a
-		// device the user had ignored comes back on startup.
-		this.ignored = ResolveIgnored(value, this.id);
+		// Discovery responses carry no pairing state, and this constructor persists straight
+		// to the cache below. Without the cache fallback a scan reply that arrives before the
+		// cached devices load rebuilds the controller as unpaired and writes that over the
+		// stored true, so the device stops linking itself on startup.
+		this.paired = value?.paired ?? discovery.cache.Get(this.id)?.paired ?? false;
 
 		let response;
 
@@ -876,14 +678,9 @@ class GoveeController{
 
 	updateWithValue(value){
 		this.id = value.id;
-		// Discovery responses carry no ignore state, so only take it when it is actually present.
-		// Assigning it blindly un-ignored the device on every scan reply. Older cache entries carry
-		// the inverse under "paired", so accept that too rather than silently keeping the default.
-		if(value?.ignored !== undefined){
-			this.ignored = value.ignored;
-		}else if(value?.paired !== undefined){
-			this.ignored = value.paired === false;
-		}
+		// Discovery responses carry no pairing state, so only take it when it's actually
+		// present. Assigning it blindly unpaired the device on every scan reply.
+		this.paired = value.paired ?? this.paired;
 
 		let response;
 
@@ -905,39 +702,19 @@ class GoveeController{
 		service.updateController(this);
 	}
 
-	/** Promotes this controller to a device, once and only once.
-	 *
-	 * Both the discovery Update tick and the old link path wanted to do this, and announcing twice
-	 * puts the device in SignalRGB's list twice -- which is why an accepted device showed up as two
-	 * identical tiles while an ignored one showed up as one. The guard belongs on the controller
-	 * rather than at either call site, because neither can know what the other already did. */
-	announce(){
-		if(this.initialized){
-			return;
-		}
-
-		this.initialized = true;
-		service.updateController(this);
-
-		// An ignored device keeps its controller, so it can be restored from the interface, but is
-		// never promoted to a device. Announcing it regardless is why ignoring one did not survive a
-		// restart: the controller was rebuilt un-suppressed and nothing put it back.
-		if(this.ignored){
-			return;
-		}
-
-		service.announceController(this);
-	}
-
 	update(){
-		this.announce();
+		if(!this.initialized){
+			this.initialized = true;
+			service.updateController(this);
+			service.announceController(this);
+		}
 	}
 
 	cacheControllerInfo(value){
 		discovery.cache.Add(
 			value.id, {
 				id: value.id,
-				ignored: value.ignored,
+				paired: value.paired,
 				ip: value.ip,
 				name: value.sku,
 				GoveeInfo: value.GoveeInfo,
@@ -994,12 +771,10 @@ class GoveeProtocol {
 	 * BB 00 01 B1 01 0A and BB 00 01 B1 00 0B: command 0xB1, enable and disable. Colour
 	 * frames (0xB0) are ignored unless this has been enabled.
 	 *
-	 * NOT FREE TO SEND. Enabling drops a frame on the device as it re-enters stream mode -- and the
-	 * dropped frame cannot be refilled, since the colour frame Render sends immediately afterwards in
-	 * the same tick is itself discarded. One is unnoticeable at startup; on a repeat it reads as a
-	 * black flash, which shipped twice, at every 150 frames and then every 40 seconds. Send it when
-	 * control is actually being taken, never on a timer, and never as a cheap "just in case".
-	 * MaintainStreamingMode is the only thing that should ever call this outside of setup. */
+	 * NOT FREE TO SEND. Enabling costs a brief blank on the device as it re-enters stream mode.
+	 * One is unnoticeable at startup; on a repeat it reads as a black flash, and sending it every
+	 * 150 frames was the source of the flicker reports. Send it when control is actually being
+	 * taken, never on a timer, and never as a cheap "just in case". */
 	SetStreamingMode(enable){
 		UDPServer.send(JSON.stringify({msg:{cmd:"razer", data:{pt:enable?"uwABsQEK":"uwABsQAL"}}}));
 	}
@@ -1079,8 +854,7 @@ class GoveeProtocol {
 
 		if(!loggedFirstFrame){
 			loggedFirstFrame = true;
-			const layout = subdevices.length > 0 ? `${subdevices.length} subdevice(s)` : `${ledCount} LED(s)`;
-			device.log(`Streaming started: ${packet.length} byte frame over ${layout}.`);
+			device.log(`Streaming started: ${packet.length} byte frame over ${channels.length} channel(s).`);
 		}
 
 		// Debug
@@ -1088,11 +862,7 @@ class GoveeProtocol {
 
 		const now = Date.now();
 
-		// Switchable because it is the main suspect for knocking the device out of stream mode: it is
-		// a non-razer command arriving in the middle of the frame stream, once a second, and Shutdown
-		// already has to leave stream mode before colorwc will stick. Its replies are also the only
-		// liveness signal we have, so the two cannot be judged separately -- hence the setting.
-		if (statusQuery && now - this.lastPacket > 1000) {
+		if (now - this.lastPacket > 1000) {
 			UDPServer.send(JSON.stringify({
 				msg: {
 					cmd: "status",
@@ -1112,11 +882,36 @@ class GoveeProtocol {
 		}));
 	}
 
+	GetChannelRGB(channelName, overrideColor){
+		const componentChannel = device.channel(channelName);
+		const ChannelLedCount = componentChannel.LedCount();
+
+		if(overrideColor) {
+			return device.createColorArray(overrideColor, ChannelLedCount, "Inline");
+		}
+
+		if(LightingMode === "Forced"){
+			return device.createColorArray(forcedColor, ChannelLedCount, "Inline");
+		}
+
+		if(componentChannel.shouldPulseColors()){
+			const pulseColor = device.getChannelPulseColor(channelName);
+			const pulseCount = componentChannel.LedLimit();
+
+			return device.createColorArray(pulseColor, pulseCount, "Inline");
+		}
+
+		return componentChannel.getColors("Inline");
+	}
+
 	SendRGB(overrideColor) {
+		let RGBData = [];
 		let packet  = [];
-		// Subdevice devices are several physical pieces placed separately on the canvas, so their
-		// colors are read per piece. Everything else is one run read straight from the layout.
-		const RGBData = subdevices.length > 0 ? GetRGBFromSubdevices(overrideColor) : GetDeviceRGB(overrideColor);
+
+		// Segments go on the wire in channel order, matching how the device chains them.
+		for(const channel of channels){
+			RGBData = RGBData.concat(this.GetChannelRGB(channel.name, overrideColor));
+		}
 
 		switch (protocolSelect === "Auto" ? autoProtocol : protocolSelect) {
 			// One Dreamview frame, with the length computed. The old split into V1/V2 was really
@@ -1241,19 +1036,13 @@ class UdpSocketServer{
 		this.log(`Socket Bound: ${this.server.state === this.server.BoundState}`);
 	};
 	onMessage(msg){
+		this.log('Data received from client');
+		this.log(msg, {pretty: true});
+
 		if(this.isDiscoveryServer) {
-			this.log('Data received from client');
-			this.log(msg, {pretty: true});
 			discovery.forceDiscovery(msg);
 			this.server.close();
-
-			return;
 		}
-
-		// A device socket's replies used to be logged and dropped on the floor. They arrive about
-		// once a second, so they are handed to the callback rather than logged -- the handler decides
-		// what is worth saying.
-		this.responseCallbackFunction(msg);
 	};
 	onError(code, message){
 		this.log(`Error: ${code} - ${message}`);
