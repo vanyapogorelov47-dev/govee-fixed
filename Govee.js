@@ -126,6 +126,18 @@ export function Render(){
 		return;
 	}
 
+	// Initialize connects to whatever IP the controller had at the time, and on startup that is
+	// the cached one. If DHCP has since moved the device, discovery finds it at the new address
+	// and updates the controller, but our socket keeps streaming at the old one and the device
+	// stays dark -- until the user toggles it off and on, which is just Initialize again. Do that
+	// here instead.
+	if(UDPServer !== undefined && controller.ip && controller.ip !== "Unknown IP" && UDPServer.ipToConnectTo !== controller.ip){
+		device.log(`Device moved from ${UDPServer.ipToConnectTo} to ${controller.ip}. Reconnecting.`);
+		Initialize();
+
+		return;
+	}
+
 	// Uncomment to trace the render loop. Distinguishes a loop that never starts from one
 	// that starts and later stops -- neither is otherwise visible, since a device holds its
 	// last color rather than going dark.
@@ -691,6 +703,8 @@ class GoveeController{
 			response = value
 		}
 
+		const previousIp = this.ip;
+
 		this.ip = response?.ip ?? "Unknown IP";
 		this.device = response.device;
 		this.sku = response?.sku ?? "Unknown Govee SKU";
@@ -698,6 +712,14 @@ class GoveeController{
 		this.bleVersionSoft = response?.bleVersionSoft ?? "Unknown";
 		this.wifiVersionHard = response?.wifiVersionHard ?? "Unknown";
 		this.wifiVersionSoft = response?.wifiVersionSoft ?? "Unknown";
+
+		// Nothing else writes a changed IP back, so the cache kept the address from the first
+		// discovery forever and every startup connected to it -- a dark device whenever DHCP had
+		// moved it since.
+		if(this.ip !== previousIp && this.ip !== "Unknown IP" && this.sku !== "Unknown Govee SKU"){
+			service.log(`${this.sku} moved from ${previousIp} to ${this.ip}. Updating cache.`);
+			this.cacheControllerInfo(this);
+		}
 
 		service.updateController(this);
 	}
