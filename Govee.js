@@ -54,6 +54,25 @@ let sawConnectedSocket = false;
 /** So the "not initialized yet" warning is logged once rather than every frame. */
 let loggedMissingProtocol = false;
 
+/** When Initialize ran, and how many of the startup re-handshakes have gone out since.
+ *
+ * The handshake -- power on, then 0xB1 into stream mode -- is two unacknowledged datagrams. When
+ * the PC boots, the strip is still joining Wi-Fi as SignalRGB comes up, so both land on nothing,
+ * and since replies from the device socket never reach us, nothing notices. The strip stays dark
+ * until the user toggles it, which is just Initialize again with the strip online. Resend it a few
+ * times while the strip is likely to still be coming up. Each one costs a dropped frame, which in
+ * the first two minutes after boot nobody sees; the flicker fixed earlier came from asserts that
+ * kept going all evening. */
+let initializedAt = 0;
+let handshakeRetry = 0;
+const HandshakeRetryAt = [5000, 15000, 30000, 60000, 120000];
+
+/** The last discovery sighting this device instance has acted on. Discovery hears the strip answer
+ * scans even though the device socket hears nothing, so a sighting after a long gap -- or the first
+ * one at all -- means the strip has (re)joined the network and needs the handshake again. */
+let lastSightingSeen = 0;
+const SightingGapMeansGone = 150000;
+
 /** Whether this device should let the firmware fade between the colors we send. Seeded from the
  * library per device, since whether blending helps depends on the device being one continuous run
  * of LEDs rather than several separate pieces. */
@@ -82,6 +101,9 @@ export function Initialize(){
 	loggedFirstStatusReply = false;
 	loggedNoStatusReplies = false;
 	streamLooksLost = false;
+	initializedAt = Date.now();
+	handshakeRetry = 0;
+	lastSightingSeen = 0;
 	device.addFeature("base64");
 
 	device.setName(controller.sku);
@@ -155,6 +177,9 @@ export function Render(){
 		govee.SetStreamingMode(true);
 	}
 
+	RetryHandshakeWhileStarting();
+	RehandshakeOnSighting();
+
 	// Stream mode is handed to us by one unacknowledged datagram, so a lost packet leaves the device
 	// ignoring every frame while looking fine from here. Assert it on the opening frames to cover
 	// that. Beyond that, only re-assert it if the device has actually gone quiet -- see
@@ -165,6 +190,46 @@ export function Render(){
 
 	govee.SendRGB();
 	device.pause(10);
+}
+
+function Handshake(reason){
+	device.log(`Sending power-on and stream mode again: ${reason}.`);
+	govee.setDeviceState(true);
+	govee.SetStreamingMode(true);
+}
+
+/** See HandshakeRetryAt. */
+function RetryHandshakeWhileStarting(){
+	if(handshakeRetry >= HandshakeRetryAt.length){
+		return;
+	}
+
+	if(Date.now() - initializedAt < HandshakeRetryAt[handshakeRetry]){
+		return;
+	}
+
+	handshakeRetry++;
+	Handshake(`startup retry ${handshakeRetry} of ${HandshakeRetryAt.length}`);
+}
+
+/** See lastSightingSeen. controller.lastSeen is stamped by updateWithValue on every scan reply. */
+function RehandshakeOnSighting(){
+	const seen = controller.lastSeen;
+
+	if(!seen || seen === lastSightingSeen){
+		return;
+	}
+
+	const first = lastSightingSeen === 0;
+	const gap = seen - lastSightingSeen;
+
+	lastSightingSeen = seen;
+
+	if(first){
+		Handshake("first discovery reply since initialize");
+	}else if(gap > SightingGapMeansGone){
+		Handshake(`device answered discovery again after ${Math.round(gap / 1000)}s`);
+	}
 }
 
 /** Re-asserts stream mode, but only where there is a reason to.
@@ -366,6 +431,9 @@ export function DiscoveryService() {
 
 	this.lastPollTime = 0;
 	this.PollInterval = 60000;
+	this.startedAt = Date.now();
+	this.FastPollFor = 120000;
+	this.FastPollInterval = 5000;
 
 	this.cache = new IPCache();
 	this.activeSockets = new Map();
@@ -425,7 +493,12 @@ export function DiscoveryService() {
 	};
 
 	this.CheckForDevices = function(){
-		if(Date.now() - discovery.lastPollTime < discovery.PollInterval){
+		// Right after boot the strip is still joining Wi-Fi. Scan often until it has had time to,
+		// so it is seen -- and handed its handshake -- within seconds rather than a minute later.
+		const starting = Date.now() - discovery.startedAt < discovery.FastPollFor;
+		const interval = starting ? discovery.FastPollInterval : discovery.PollInterval;
+
+		if(Date.now() - discovery.lastPollTime < interval){
 			return;
 		}
 
@@ -699,6 +772,9 @@ class GoveeController{
 		// Handle discovery or cached device
 		if (value.response) {
 			response = JSON.parse(value.response).msg.data;
+			// Only a real scan reply proves the device is on the network right now; the other
+			// callers pass cached or in-memory state. Render watches this -- see RehandshakeOnSighting.
+			this.lastSeen = Date.now();
 		} else {
 			response = value
 		}
